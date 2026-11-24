@@ -413,7 +413,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
-        let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(1 << 16))?;
+        let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(1 << 16) + copy_slack())?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -435,6 +435,29 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     entry.shadow.clone()
 }
 
+/// Zeroed host memory past the end of each copy of title memory. On the
+/// console a shader that reads a little past a buffer (or a window of loose
+/// memory) reads the title memory that follows; here the copies lie apart,
+/// and such a read lands in whatever the host placed after the copy (a GPU
+/// page fault when that was freed). It reads zeros here instead.
+// shortcut: zeros, not the title memory that follows.
+const COPY_SLACK: u64 = 256 << 10;
+
+/// [`COPY_SLACK`], or `VICTORY_COPY_SLACK` (bytes) in diagnostics builds.
+fn copy_slack() -> u64 {
+    static SLACK: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SLACK.get_or_init(|| {
+        if cfg!(feature = "diagnostics") {
+            std::env::var("VICTORY_COPY_SLACK")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(COPY_SLACK)
+        } else {
+            COPY_SLACK
+        }
+    })
+}
+
 /// Titles also use memory outside any buffer object as GPU memory (Grand
 /// Theft Auto VI's interface vertices, from its own allocator). Such memory
 /// gets copies of the aligned windows it touches.
@@ -442,17 +465,36 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// allocations if memory use grows.
 const WINDOW: u64 = 4 << 20;
 
+/// [`WINDOW`], or `VICTORY_LOOSE_WINDOW` (bytes, a power of two) in
+/// diagnostics builds: shaders reading loose memory past the window their
+/// descriptors named read past its copy (a GPU page fault), where the
+/// console reads on into the title's memory.
+fn window() -> u64 {
+    static SIZE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        if cfg!(feature = "diagnostics") {
+            std::env::var("VICTORY_LOOSE_WINDOW")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .filter(|v| v.is_power_of_two() && *v >= 1 << 16)
+                .unwrap_or(WINDOW)
+        } else {
+            WINDOW
+        }
+    })
+}
+
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
-    let start = address & !(WINDOW - 1);
-    let len = end.next_multiple_of(WINDOW) - start;
+    let start = address & !(window() - 1);
+    let len = end.next_multiple_of(window()) - start;
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(shadow) = map.get(&(start, len)) {
         return Some(shadow.clone());
     }
-    let (buffer, data) = host()?.shared_buffer(len)?;
+    let (buffer, data) = host()?.shared_buffer(len + copy_slack())?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
