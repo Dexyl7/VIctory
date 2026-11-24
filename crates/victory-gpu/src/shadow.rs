@@ -494,18 +494,95 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     if let Some(shadow) = map.get(&(start, len)) {
         return Some(shadow.clone());
     }
-    let (buffer, data) = host()?.shared_buffer(len + copy_slack())?;
+    let (buffer, data, gpu, how) = match mirrored(start, len) {
+        Some((buffer, data, gpu)) => (buffer, data, gpu, "mirrored"),
+        None => {
+            let (buffer, data) = host()?.shared_buffer(len + copy_slack())?;
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            (buffer, data, gpu, "copied")
+        }
+    };
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
-    // SAFETY: a live buffer.
-    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     tracing::debug!(
         start = format_args!("{start:#x}"),
         len,
+        how,
         "loose memory copied to the host"
     );
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, start, len));
     map.insert((start, len), shadow.clone());
     Some(shadow)
+}
+
+/// Title addresses the mirror covers: `[0, MIRROR_SPAN)`.
+const MIRROR_SPAN: u64 = 1 << 36;
+/// A tile of a reserved buffer.
+const TILE: u64 = 64 << 10;
+
+/// One reserved buffer standing for title addresses `[0, MIRROR_SPAN)`
+/// (diagnostics, `VICTORY_MIRROR`). Windows of loose memory are mapped into
+/// it at their title addresses, so a shader that reads past a window reads
+/// on into the next window's copy (or zeros, where none is mapped), as the
+/// console reads on into its memory, instead of whatever the host placed
+/// after the copy (a GPU page fault when that was freed).
+// shortcut: buffer objects keep copies of their own; windows overlapping
+// a mapped one too (see [`mirrored`]).
+struct Mirror {
+    buffer: ID3D12Resource,
+    gpu: u64,
+    /// Which tiles are mapped, and the heaps behind them (kept: windows are
+    /// never freed).
+    mapped: Mutex<(Vec<bool>, Vec<windows::Win32::Graphics::Direct3D12::ID3D12Heap>)>,
+}
+
+// SAFETY: D3D12 objects are free-threaded; the rest is behind the mutex.
+unsafe impl Send for Mirror {}
+// SAFETY: as above.
+unsafe impl Sync for Mirror {}
+
+fn mirror() -> Option<&'static Mirror> {
+    static MIRROR: std::sync::OnceLock<Option<Mirror>> = std::sync::OnceLock::new();
+    MIRROR
+        .get_or_init(|| {
+            if !cfg!(feature = "diagnostics") || std::env::var_os("VICTORY_MIRROR").is_none() {
+                return None;
+            }
+            let buffer = host()?.reserved_buffer(MIRROR_SPAN)?;
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            crate::host::name(&buffer, || "title memory mirror".to_owned());
+            tracing::info!(gpu = format_args!("{gpu:#x}"), "title memory mirror");
+            Some(Mirror {
+                buffer,
+                gpu,
+                mapped: Mutex::new((vec![false; (MIRROR_SPAN / TILE) as usize], Vec::new())),
+            })
+        })
+        .as_ref()
+}
+
+/// Loose memory `[start, start + len)` in a heap of its own, mapped into the
+/// mirror at its title address: the buffer, its CPU address, its GPU address
+/// in the mirror. `None` (a plain copy then) without a mirror, past its span,
+/// or where a tile is already mapped (an overlapping window).
+fn mirrored(start: u64, len: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
+    let m = mirror()?;
+    if start % TILE != 0 || len % TILE != 0 || start.checked_add(len)? > MIRROR_SPAN {
+        return None;
+    }
+    let (first, n) = ((start / TILE) as usize, (len / TILE) as usize);
+    let mut guard = m.mapped.lock().unwrap_or_else(|e| e.into_inner());
+    let (tiles, heaps) = &mut *guard;
+    if tiles[first..first + n].iter().any(|&t| t) {
+        return None;
+    }
+    let host = host()?;
+    let (heap, buffer, data) = host.heap_buffer(len)?;
+    host.map_tiles(&m.buffer, first as u32, &heap, n as u32);
+    tiles[first..first + n].fill(true);
+    heaps.push(heap);
+    Some((buffer, data, m.gpu + start))
 }
 
 /// For device-removed reports: the copy of title memory whose host range

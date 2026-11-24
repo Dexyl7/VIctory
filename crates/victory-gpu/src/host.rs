@@ -1767,6 +1767,150 @@ impl Host {
     /// it is fast too) and shaders read and write: for host copies of title
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
+    /// A reserved buffer of `size` bytes: no memory behind it until tiles
+    /// are mapped. `None` below tiled resources tier 2 (where reads of
+    /// unmapped tiles return zero).
+    pub(crate) fn reserved_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+        // SAFETY: the query writes the structure of the given size.
+        let tier = unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .map(|()| options.TiledResourcesTier);
+        match tier {
+            Ok(t) if t.0 >= D3D12_TILED_RESOURCES_TIER_2.0 => {}
+            other => {
+                tracing::warn!(?other, "no tiled resources tier 2");
+                return None;
+            }
+        }
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a reserved buffer.
+        let made = unsafe {
+            self.device
+                .CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer)
+        };
+        match made {
+            Ok(()) => buffer,
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no reserved buffer");
+                None
+            }
+        }
+    }
+
+    /// A buffer of `size` bytes (a multiple of 64 KiB) alone in a heap of
+    /// CPU-visible system memory, mapped: the heap (to map as tiles of a
+    /// reserved buffer too), the buffer and its CPU address.
+    pub(crate) fn heap_buffer(&self, size: u64) -> Option<(ID3D12Heap, ID3D12Resource, *mut u8)> {
+        let heap_desc = D3D12_HEAP_DESC {
+            SizeInBytes: size,
+            Properties: D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                ..Default::default()
+            },
+            Alignment: 0,
+            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut heap: Option<ID3D12Heap> = None;
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: plain creation of a heap, a buffer at its start, and its
+        // mapping.
+        let made = unsafe {
+            self.device.CreateHeap(&heap_desc, &mut heap).and_then(|()| {
+                let h = heap.as_ref().ok_or_else(windows::core::Error::empty)?;
+                self.device.CreatePlacedResource(
+                    h,
+                    0,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut buffer,
+                )?;
+                let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                b.Map(0, None, Some(&mut data))
+            })
+        };
+        match made {
+            Ok(()) => Some((heap?, buffer?, data.cast())),
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no heap buffer");
+                None
+            }
+        }
+    }
+
+    /// Maps `tiles` 64 KiB tiles of reserved buffer `reserved`, from tile
+    /// `first` on, to the start of `heap`. Queued: later submissions see it.
+    pub(crate) fn map_tiles(&self, reserved: &ID3D12Resource, first: u32, heap: &ID3D12Heap, tiles: u32) {
+        let coordinate = D3D12_TILED_RESOURCE_COORDINATE {
+            X: first,
+            Y: 0,
+            Z: 0,
+            Subresource: 0,
+        };
+        let size = D3D12_TILE_REGION_SIZE {
+            NumTiles: tiles,
+            UseBox: false.into(),
+            Width: tiles,
+            Height: 1,
+            Depth: 1,
+        };
+        let flags = D3D12_TILE_RANGE_FLAG_NONE;
+        let offset = 0u32;
+        // SAFETY: one region and one range, each of `tiles` tiles, inside
+        // the buffer and the heap (the caller's checks).
+        unsafe {
+            self.queue.UpdateTileMappings(
+                reserved,
+                1,
+                Some(&coordinate),
+                Some(&size),
+                heap,
+                1,
+                Some(&flags),
+                Some(&offset),
+                Some(&tiles),
+                D3D12_TILE_MAPPING_FLAG_NONE,
+            );
+        }
+    }
+
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_CUSTOM,
