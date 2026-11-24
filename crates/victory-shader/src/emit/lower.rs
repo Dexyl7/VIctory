@@ -5871,7 +5871,10 @@ impl<'a> Lower<'a> {
             // Coordinates the size divides (not the array slice); explicit
             // gradients (x then y) come before the coordinates.
             let spatial = coords - usize::from(kind == 6 || kind == 7);
-            let grads = if op == 63 { 2 * spatial } else { 0 };
+            // Gradients per direction: a cube's are on the face (s and t,
+            // the decoder's count too).
+            let grad_n = if kind == 5 { 2 } else { spatial };
+            let grads = if op == 63 { 2 * grad_n } else { 0 };
             let mut cs = vec![fu; 4];
             // With a16, sampling coordinates and LOD are f16.
             let to_float = |l: &mut Self, x: V| {
@@ -5886,9 +5889,11 @@ impl<'a> Lower<'a> {
                 let x = addr_val(self, first + grads + k)?;
                 *slot = to_float(self, x);
             }
+            // The face id, for a cube's gradients.
+            let face = cs[2];
             if kind == 5 {
-                if *unorm || op == 63 || op == 81 {
-                    return Err("a cube sample with texel coordinates, gradients or a level query");
+                if *unorm || op == 81 {
+                    return Err("a cube sample with texel coordinates or a level query");
                 }
                 let dir = self.cube_direction(cs[0], cs[1], cs[2]);
                 cs[..3].copy_from_slice(&dir);
@@ -5983,11 +5988,18 @@ impl<'a> Lower<'a> {
                 }
                 63 => {
                     let mut g = vec![fu; 6];
-                    for k in 0..spatial {
+                    for k in 0..grad_n {
                         let x = addr_val(self, first + k)?;
                         g[k] = to_float(self, x);
-                        let y = addr_val(self, first + spatial + k)?;
+                        let y = addr_val(self, first + grad_n + k)?;
                         g[3 + k] = to_float(self, y);
+                    }
+                    if kind == 5 {
+                        // Face gradients (of s and t) to the direction's.
+                        let gx = self.cube_gradient(g[0], g[1], face);
+                        let gy = self.cube_gradient(g[3], g[4], face);
+                        g[..3].copy_from_slice(&gx);
+                        g[3..].copy_from_slice(&gy);
                     }
                     args.extend(&os);
                     args.extend(g);
@@ -6261,6 +6273,40 @@ impl<'a> Lower<'a> {
             [one, mone, u, u, u, nu],
             [nv, nv, one, mone, nv, nv],
             [nu, u, v, nv, one, mone],
+        ];
+        table.map(|row| {
+            let mut r = row[0];
+            for (n, &x) in row.iter().enumerate().skip(1) {
+                let kn = self.s.m.i32(n as u32);
+                let is = self.s.m.cmp(c, pred::EQ, f, kn);
+                r = self.s.m.select(c, is, x, r);
+            }
+            r
+        })
+    }
+
+    /// The change of [`Self::cube_direction`] for a change `(ds, dt)` of the
+    /// face coordinates: the same map without the major axis and offset, as
+    /// the direction is linear in s and t on a face.
+    // shortcut: the console's face gradients are taken in units of s and t
+    // (a face spans 1), unverified on hardware.
+    fn cube_gradient(&mut self, ds: V, dt: V, face: V) -> [V; 3] {
+        let c = self.cur;
+        let two = self.s.m.f32(2.0f32.to_bits());
+        let u = self.s.m.bin(c, Bin::Mul, ds, two);
+        let v = self.s.m.bin(c, Bin::Mul, dt, two);
+        let z = self.s.m.f32(0x8000_0000);
+        let (nu, nv) = (
+            self.s.m.bin(c, Bin::Sub, z, u),
+            self.s.m.bin(c, Bin::Sub, z, v),
+        );
+        let zero = self.s.m.f32(0);
+        let f = self.s.m.cast(c, Cast::FpToUi, face, self.s.t.i32);
+        // Per face +x, -x, +y, -y, +z, -z, as `cube_direction`'s table.
+        let table = [
+            [zero, zero, u, u, u, nu],
+            [nv, nv, zero, zero, nv, nv],
+            [nu, u, v, nv, zero, zero],
         ];
         table.map(|row| {
             let mut r = row[0];
