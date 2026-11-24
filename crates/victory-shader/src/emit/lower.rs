@@ -5594,9 +5594,6 @@ impl<'a> Lower<'a> {
             return Err("an image access with tfe or lwe");
         }
         let name = inst.name();
-        if *a16 && name.starts_with("image_sample_b") {
-            return Err("a biased image sample with 16-bit coordinates");
-        }
         // A load or sample with no channel enabled returns the first.
         let dmask = if *dmask == 0 { &1 } else { dmask };
         let site = (b, i);
@@ -5625,18 +5622,35 @@ impl<'a> Lower<'a> {
                 regs.extend((0..dwords).map(|k| reg + k));
             }
         }
-        // With a16, two 16-bit components per VGPR, low half first.
+        // With a16, two 16-bit components per VGPR, low half first, after
+        // the offset, bias and z-compare, which keep a VGPR each (the offset
+        // and z-compare 32-bit, the bias a half in the low 16 bits).
+        let whole = if *a16 {
+            name.strip_prefix("image_sample")
+                .or_else(|| name.strip_prefix("image_gather4"))
+                .map_or(0, |rest| {
+                    rest.split('_')
+                        .filter(|t| matches!(*t, "o" | "b" | "c"))
+                        .count()
+                })
+        } else {
+            0
+        };
         let addr_val = |l: &mut Self, k: usize| -> Result<V, Why> {
+            let packed = k.checked_sub(whole);
             let r = *regs
-                .get(if *a16 { k / 2 } else { k })
+                .get(match packed {
+                    Some(j) if *a16 => whole + j / 2,
+                    _ => k,
+                })
                 .ok_or("an image address")?;
             let v = inst.read(Reg::V(r)).ok_or("an image address")?;
             let x = l.i32_of(v)?;
-            if !*a16 {
+            let Some(j) = packed.filter(|_| *a16) else {
                 return Ok(x);
-            }
+            };
             let c = l.cur;
-            let (sh, mask) = (l.s.m.i32(16 * (k as u32 % 2)), l.s.m.i32(0xFFFF));
+            let (sh, mask) = (l.s.m.i32(16 * (j as u32 % 2)), l.s.m.i32(0xFFFF));
             let x = l.s.m.bin(c, Bin::LShr, x, sh);
             Ok(l.s.m.bin(c, Bin::And, x, mask))
         };
@@ -5784,7 +5798,7 @@ impl<'a> Lower<'a> {
             "image_sample_lz" | "image_sample_l" => (62, true),
             "image_sample_b" => (61, true),
             "image_sample_c_lz" => (65, true),
-            "image_sample_d" => (63, true),
+            "image_sample_d" | "image_sample_d_cl" => (63, true),
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" if self.s.pixel => (64, true),
@@ -5953,8 +5967,9 @@ impl<'a> Lower<'a> {
                         .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
                 }
                 61 => {
+                    // With a16, a half in the low 16 bits.
                     let bias = addr_val(self, 0)?;
-                    let bias = self.as_float(bias);
+                    let bias = to_float(self, bias);
                     args.extend(&os);
                     args.extend([bias, fu]);
                     self.s.op(
@@ -5976,7 +5991,15 @@ impl<'a> Lower<'a> {
                     }
                     args.extend(&os);
                     args.extend(g);
-                    args.push(fu);
+                    // `_cl`: the level clamp, the address after the
+                    // coordinates (DXIL's clamp operand).
+                    let clamp = if name.ends_with("_cl") {
+                        let x = addr_val(self, first + grads + coords)?;
+                        to_float(self, x)
+                    } else {
+                        fu
+                    };
+                    args.push(clamp);
                     self.s.op(
                         c,
                         "sampleGrad.f32",
