@@ -5788,7 +5788,8 @@ impl<'a> Lower<'a> {
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" if self.s.pixel => (64, true),
-            "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" => (73, true),
+            "image_gather4" | "image_gather4_l" | "image_gather4_l_o" | "image_gather4_lz"
+            | "image_gather4_lz_o" => (73, true),
             "image_load" | "image_load_mip" => (66, false),
             "image_get_resinfo" => (72, false),
             _ => return Err(name),
@@ -5833,6 +5834,8 @@ impl<'a> Lower<'a> {
         let h = self.handle(site, src, false, props)?;
         let fu = self.s.m.undef(self.s.t.f32);
         let iu = self.s.m.undef(self.s.t.i32);
+        // A gather built from point reads (`image_gather4_l`): its four values.
+        let mut gathered: Option<[V; 4]> = None;
         let r = if sample {
             let ss = self
                 .descriptors
@@ -6015,6 +6018,101 @@ impl<'a> Lower<'a> {
                         &args,
                     )
                 }
+                _ if name == "image_gather4_l" || name == "image_gather4_l_o" => {
+                    // The host's gathers read level 0 only: four reads at
+                    // the centres of the footprint's texels, at the given
+                    // level, in gather order.
+                    // shortcut: the level is rounded to the nearest one (a
+                    // console gather reads a single level; which way a
+                    // fraction goes is unverified), and the sampler is taken
+                    // to return a texel's own value at its centre (no
+                    // anisotropy).
+                    if dmask.count_ones() != 1 {
+                        return Err("a gather of several channels");
+                    }
+                    if spatial != 2 || kind == 5 {
+                        return Err("a gather at a level of a view that is not 2D");
+                    }
+                    let i32t = self.s.t.i32;
+                    let f32t = self.s.t.f32;
+                    let dims_t = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+                    let lod = addr_val(self, first + coords)?;
+                    let lod = to_float(self, lod);
+                    let z = self.s.m.i32(0);
+                    let d0 = self
+                        .s
+                        .op(c, "getDimensions", Attr::ReadOnly, dims_t, 72, &[h, z]);
+                    let levels = self.s.m.extract(c, d0, 3);
+                    let levels = self.s.m.cast(c, Cast::UiToFp, levels, f32t);
+                    let one = self.s.m.f32(1.0f32.to_bits());
+                    let top = self.s.m.bin(c, Bin::Sub, levels, one);
+                    let zf = self.s.m.f32(0);
+                    // FMax, FMin, then Round_ne: a level the view has.
+                    let lod = self.binary(35, lod, zf);
+                    let lod = self.binary(36, lod, top);
+                    let lod = self.unary(26, lod);
+                    let mip = self.s.m.cast(c, Cast::FpToUi, lod, i32t);
+                    let d = self
+                        .s
+                        .op(c, "getDimensions", Attr::ReadOnly, dims_t, 72, &[h, mip]);
+                    let half = self.s.m.f32(0.5f32.to_bits());
+                    // `_o`: texel offsets, 6-bit signed, x in bits 0-5, y in
+                    // 8-13 (as the level-0 gathers below take them).
+                    let mut shift = [None; 2];
+                    if offset_word {
+                        let w = addr_val(self, 0)?;
+                        for (k, at) in [(0, 26), (1, 18)] {
+                            let left = self.s.m.i32(at);
+                            let t = self.s.m.bin(c, Bin::Shl, w, left);
+                            let k26 = self.s.m.i32(26);
+                            let t = self.s.m.bin(c, Bin::AShr, t, k26);
+                            shift[k] = Some(self.s.m.cast(c, Cast::SiToFp, t, f32t));
+                        }
+                    }
+                    let (mut lo, mut hi) = ([fu; 2], [fu; 2]);
+                    for k in 0..2 {
+                        let n = self.s.m.extract(c, d, k as u32);
+                        let n = self.s.m.cast(c, Cast::UiToFp, n, f32t);
+                        // The footprint's first texel: floor(coordinate × size - 0.5)
+                        // (Round_ni), then the centres of it and the next.
+                        let t = self.s.m.bin(c, Bin::Mul, cs[k], n);
+                        let t = self.s.m.bin(c, Bin::Sub, t, half);
+                        let t = self.unary(27, t);
+                        let t = match shift[k] {
+                            Some(o) => self.s.m.bin(c, Bin::Add, t, o),
+                            None => t,
+                        };
+                        let c0 = self.s.m.bin(c, Bin::Add, t, half);
+                        let c1 = self.s.m.bin(c, Bin::Add, c0, one);
+                        lo[k] = self.s.m.bin(c, Bin::SDiv, c0, n);
+                        hi[k] = self.s.m.bin(c, Bin::SDiv, c1, n);
+                    }
+                    let ch = dmask.trailing_zeros();
+                    // Gather order: (u0, v1), (u1, v1), (u1, v0), (u0, v0).
+                    let corners = [
+                        (lo[0], hi[1]),
+                        (hi[0], hi[1]),
+                        (hi[0], lo[1]),
+                        (lo[0], lo[1]),
+                    ];
+                    let mut g = [fu; 4];
+                    for (k, (u, v)) in corners.into_iter().enumerate() {
+                        let mut a = vec![h, sh, u, v, cs[2], cs[3]];
+                        a.extend(&os);
+                        a.push(lod);
+                        let s = self.s.op(
+                            c,
+                            "sampleLevel.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            62,
+                            &a,
+                        );
+                        g[k] = self.s.m.extract(c, s, ch);
+                    }
+                    gathered = Some(g);
+                    self.s.m.undef(self.s.t.res_ret)
+                }
                 _ => {
                     if name == "image_gather4" {
                         return Err("a gather with implicit level");
@@ -6080,7 +6178,10 @@ impl<'a> Lower<'a> {
         };
         let mut xs = Vec::new();
         for ch in channels {
-            let x = self.s.m.extract(c, r, ch);
+            let x = match gathered {
+                Some(g) => g[ch as usize],
+                None => self.s.m.extract(c, r, ch),
+            };
             xs.push(if *d16 {
                 // shortcut: d16 results are taken as floats (rounded to
                 // nearest even); integer formats would keep 16 bits.
