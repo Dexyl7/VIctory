@@ -952,6 +952,62 @@ fn hand_out_resource(
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }
 
+/// Host copies of released textures, each with the submission count after
+/// which it is freed.
+#[cfg(windows)]
+static PARKED: std::sync::Mutex<std::collections::VecDeque<(u64, std::sync::Arc<HostTexture>)>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+/// Host submissions finished so far (see [`submission_done`]).
+#[cfg(windows)]
+static SUBMISSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Host submissions a released texture's copy outlives its release by.
+/// About 40 submissions make a frame of the world, so a few frames.
+#[cfg(windows)]
+const TEXTURE_GRACE: u64 = 512;
+
+/// [`TEXTURE_GRACE`], or `VICTORY_TEXTURE_GRACE` in diagnostics builds.
+#[cfg(windows)]
+fn texture_grace() -> u64 {
+    static GRACE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *GRACE.get_or_init(|| {
+        if cfg!(feature = "diagnostics") {
+            std::env::var("VICTORY_TEXTURE_GRACE")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(TEXTURE_GRACE)
+        } else {
+            TEXTURE_GRACE
+        }
+    })
+}
+
+/// Keeps a released texture's host copy until [`texture_grace`] more
+/// submissions have finished.
+#[cfg(windows)]
+fn park(host: std::sync::Arc<HostTexture>) {
+    let due = SUBMISSIONS.load(std::sync::atomic::Ordering::Relaxed) + texture_grace();
+    PARKED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push_back((due, host));
+}
+
+/// A host submission finished (and was waited for): frees the parked
+/// copies that are due.
+#[cfg(windows)]
+pub(crate) fn submission_done() {
+    let now = SUBMISSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let freed: Vec<_> = {
+        let mut parked = PARKED.lock().unwrap_or_else(|e| e.into_inner());
+        let n = parked.iter().take_while(|(due, _)| *due <= now).count();
+        parked.drain(..n).collect()
+    };
+    // Dropped outside the lock.
+    drop(freed);
+}
+
 #[cfg(windows)]
 impl Drop for Resource {
     fn drop(&mut self) {
@@ -972,6 +1028,23 @@ impl Drop for Resource {
                     "a title texture was released while a list not yet reset names its host copy"
                 );
             }
+        }
+        // Diagnostics (`VICTORY_KEEP_TEXTURES`): host copies of released
+        // textures are never freed, to tell whether a GPU page fault inside
+        // a freed texture is one the host freed too early (leaks on purpose).
+        #[cfg(feature = "diagnostics")]
+        if std::env::var_os("VICTORY_KEEP_TEXTURES").is_some()
+            && let Some(host) = self.host.clone()
+        {
+            std::mem::forget(host);
+        }
+        // The title may release a texture whose memory its later commands
+        // still read (console memory outlives the object; streamed textures
+        // are read through heap slots after the release): the host copy is
+        // parked and freed only after some more host submissions (a GPU page
+        // fault inside a freed texture otherwise).
+        if let Some(host) = self.host.take() {
+            park(host);
         }
         crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
         crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);

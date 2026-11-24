@@ -537,6 +537,7 @@ impl Host {
                 match waited {
                     Ok(()) => {
                         WaitForSingleObject(self.event, INFINITE);
+                        crate::resource::submission_done();
                     }
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
