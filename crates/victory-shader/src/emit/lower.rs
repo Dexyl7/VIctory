@@ -2995,6 +2995,21 @@ impl<'a> Lower<'a> {
                 }
                 (props, None)
             }
+            Fields::Smem { .. } => {
+                // A buffer the code reads with scalar loads (raw, as `smem`
+                // reads views): its record count, as for buffer accesses.
+                // Constant buffer views have no host size query.
+                if !used.is_some_and(|u| u.kind == ResourceType::Srv) {
+                    return Err("a constant buffer's descriptor read as data");
+                }
+                let stride = used.map_or(0, |u| u.stride);
+                let props = if stride >= 4 && stride.is_multiple_of(4) {
+                    (12, stride)
+                } else {
+                    (11, 0)
+                };
+                (props, None)
+            }
             _ => return Err("a scalar memory read as data"),
         };
         let h = self.handle(site, &src, false, props)?;
